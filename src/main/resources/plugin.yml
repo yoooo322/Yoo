@@ -1,0 +1,10 @@
+name: FoodAbilities
+main: com.example.foodabilities.FoodAbilitiesPlugin
+version: 1.0.0
+api-version: '1.20'
+authors: ["You"]
+description: Custom food items with infinite abilities via potion infusion.
+commands:
+  foodabilities:
+    description: FoodAbilities base command
+    usage: /<command>
