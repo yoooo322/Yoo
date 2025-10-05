@@ -1,0 +1,30 @@
+# Abilities define the effects and display for custom infused foods
+abilities:
+  speed_fire:
+    name: "&bSpeed X &7+ &6Fire Resist"
+    lore:
+      - "&7Grants Speed X forever"
+      - "&7Also grants Fire Resistance forever"
+    effects:
+      - { type: SPEED, amplifier: 9, duration: infinite, ambient: true, particles: false, icon: true }
+      - { type: FIRE_RESISTANCE, amplifier: 0, duration: infinite }
+  god_mode:
+    name: "&dGodlike"
+    lore:
+      - "&7Strength X, Resistance X, Regeneration X"
+    effects:
+      - { type: INCREASE_DAMAGE, amplifier: 9, duration: infinite }
+      - { type: DAMAGE_RESISTANCE, amplifier: 9, duration: infinite }
+      - { type: REGENERATION, amplifier: 9, duration: infinite }
+
+# Custom shapeless recipes. Each entry:
+# - ability: id from abilities above
+# - ingredients: list of vanilla material names (e.g., APPLE, NETHER_STAR)
+# - result (optional): edible material used as the base of the output item
+recipes:
+  - ability: speed_fire
+    ingredients: [APPLE, SUGAR]
+    result: APPLE
+  - ability: god_mode
+    ingredients: [GOLDEN_APPLE, NETHER_STAR]
+    result: GOLDEN_APPLE
