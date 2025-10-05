@@ -3,7 +3,11 @@ package com.example.foodabilities;
 import org.bukkit.Bukkit;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
+import org.bukkit.Keyed;
 import org.bukkit.Tag;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
+import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.enchantments.Enchantment;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -25,16 +29,58 @@ import java.util.*;
 public class FoodAbilitiesPlugin extends JavaPlugin implements Listener {
 
     private NamespacedKey recipeKey;
+    private NamespacedKey keyAbilityId;
+    private Map<String, Ability> abilityById = new HashMap<>();
+    private Map<String, Material> recipeBaseByKey = new HashMap<>();
 
     @Override
     public void onEnable() {
         Bukkit.getPluginManager().registerEvents(this, this);
         this.recipeKey = new NamespacedKey(this, "infused_food");
+        this.keyAbilityId = new NamespacedKey(this, "ability");
+        saveDefaultConfig();
+        reloadPluginConfig();
         registerDynamicRecipeInfo();
         getLogger().info("FoodAbilities enabled");
     }
 
+    @Override
+    public void onDisable() {
+        abilityById.clear();
+        recipeBaseByKey.clear();
+    }
+
+    public void reloadPluginConfig() {
+        reloadConfig();
+        abilityById.clear();
+        recipeBaseByKey.clear();
+        if (getConfig().isConfigurationSection("abilities")) {
+            for (String id : getConfig().getConfigurationSection("abilities").getKeys(false)) {
+                Ability ability = Ability.fromSection(id, getConfig().getConfigurationSection("abilities." + id));
+                abilityById.put(id.toLowerCase(Locale.ROOT), ability);
+            }
+        }
+    }
+
     private void registerDynamicRecipeInfo() {
+        // Remove existing recipes from this plugin namespace (for reloads)
+        try {
+            Iterator<Recipe> it = Bukkit.recipeIterator();
+            List<NamespacedKey> toRemove = new ArrayList<>();
+            while (it.hasNext()) {
+                Recipe r = it.next();
+                if (r instanceof Keyed) {
+                    NamespacedKey k = ((Keyed) r).getKey();
+                    if (k.getNamespace().equals(this.getName().toLowerCase(Locale.ROOT))) {
+                        toRemove.add(k);
+                    }
+                }
+            }
+            for (NamespacedKey k : toRemove) {
+                Bukkit.removeRecipe(k);
+            }
+        } catch (Throwable ignored) {}
+
         // Register a broad shapeless recipe that matches: any potion + any edible
         // We then override the result dynamically in PrepareItemCraftEvent
         try {
@@ -52,6 +98,53 @@ public class FoodAbilitiesPlugin extends JavaPlugin implements Listener {
         dynamic.addIngredient(new RecipeChoice.MaterialChoice(getPotionMaterials()));
         dynamic.addIngredient(new RecipeChoice.MaterialChoice(getEdibleMaterials()));
         Bukkit.addRecipe(dynamic);
+
+        // Register config recipes
+        if (getConfig().isList("recipes")) {
+            int idx = 0;
+            for (Map<?, ?> raw : getConfig().getMapList("recipes")) {
+                idx++;
+                try {
+                    registerConfigRecipe(raw, idx);
+                } catch (Exception e) {
+                    getLogger().warning("Failed to load recipe #" + idx + ": " + e.getMessage());
+                }
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void registerConfigRecipe(Map<?, ?> raw, int idx) {
+        Object abilityObj = raw.get("ability");
+        String abilityId = abilityObj == null ? "" : String.valueOf(abilityObj).trim();
+        if (abilityId.isEmpty()) throw new IllegalArgumentException("recipe missing ability");
+        List<String> ingredients = (List<String>) raw.get("ingredients");
+        if (ingredients == null || ingredients.isEmpty()) throw new IllegalArgumentException("recipe missing ingredients");
+
+        NamespacedKey key = new NamespacedKey(this, "cfg_" + abilityId.toLowerCase(Locale.ROOT) + "_" + idx);
+        ItemStack placeholder = new ItemStack(Material.BREAD);
+        ItemMeta meta = placeholder.getItemMeta();
+        if (meta != null) {
+            meta.setDisplayName("Infused Food: " + abilityId);
+            placeholder.setItemMeta(meta);
+        }
+
+        ShapelessRecipe sr = new ShapelessRecipe(key, placeholder);
+        for (String ing : ingredients) {
+            Material m = Material.matchMaterial(ing);
+            if (m == null) throw new IllegalArgumentException("unknown material " + ing);
+            sr.addIngredient(m);
+        }
+        Bukkit.addRecipe(sr);
+
+        // Optional result base material
+        Object resultObj = raw.get("result");
+        if (resultObj != null) {
+            Material base = Material.matchMaterial(String.valueOf(resultObj));
+            if (base != null && base.isEdible()) {
+                recipeBaseByKey.put(key.getKey(), base);
+            }
+        }
     }
 
     private List<Material> getPotionMaterials() {
@@ -76,30 +169,50 @@ public class FoodAbilitiesPlugin extends JavaPlugin implements Listener {
             return;
         }
         ShapelessRecipe shapeless = (ShapelessRecipe) recipe;
-        if (!this.recipeKey.equals(shapeless.getKey())) {
+        ItemStack[] matrix = inv.getMatrix();
+        if (this.recipeKey.equals(shapeless.getKey())) {
+            ItemStack potion = null;
+            ItemStack food = null;
+            for (ItemStack stack : matrix) {
+                if (stack == null || stack.getType() == Material.AIR) continue;
+                if (isPotion(stack) && potion == null) {
+                    potion = stack;
+                } else if (isEdible(stack) && food == null) {
+                    food = stack;
+                }
+            }
+            if (potion == null || food == null) {
+                inv.setResult(new ItemStack(Material.AIR));
+                return;
+            }
+            ItemStack result = createInfusedFoodFromPotion(food, potion);
+            inv.setResult(result);
             return;
         }
 
-        ItemStack[] matrix = inv.getMatrix();
-        ItemStack potion = null;
-        ItemStack food = null;
-        // Find one potion and one edible food
-        for (ItemStack stack : matrix) {
-            if (stack == null || stack.getType() == Material.AIR) continue;
-            if (isPotion(stack) && potion == null) {
-                potion = stack;
-            } else if (isEdible(stack) && food == null) {
-                food = stack;
+        if (shapeless.getKey().getKey().startsWith("cfg_")) {
+            String keyStr = shapeless.getKey().getKey();
+            String[] parts = keyStr.split("_");
+            if (parts.length >= 3) {
+                String abilityId = parts[1];
+                ItemStack baseFood = firstEdible(matrix);
+                if (baseFood == null) {
+                    Material configured = recipeBaseByKey.get(keyStr);
+                    baseFood = new ItemStack(configured != null && configured.isEdible() ? configured : Material.BREAD);
+                }
+                Ability ability = abilityById.get(abilityId.toLowerCase(Locale.ROOT));
+                if (ability != null) {
+                    inv.setResult(createInfusedFoodFromAbility(baseFood, ability));
+                }
             }
         }
+    }
 
-        if (potion == null || food == null) {
-            inv.setResult(new ItemStack(Material.AIR));
-            return;
+    private ItemStack firstEdible(ItemStack[] matrix) {
+        for (ItemStack s : matrix) {
+            if (s != null && s.getType() != Material.AIR && s.getType().isEdible()) return s;
         }
-
-        ItemStack result = createInfusedFood(food, potion);
-        inv.setResult(result);
+        return null;
     }
 
     private boolean isPotion(ItemStack stack) {
@@ -112,7 +225,7 @@ public class FoodAbilitiesPlugin extends JavaPlugin implements Listener {
         return type.isEdible();
     }
 
-    private ItemStack createInfusedFood(ItemStack food, ItemStack potion)
+    private ItemStack createInfusedFoodFromPotion(ItemStack food, ItemStack potion)
     {
         ItemStack result = new ItemStack(food.getType(), 1);
         ItemMeta meta = result.getItemMeta();
@@ -138,7 +251,30 @@ public class FoodAbilitiesPlugin extends JavaPlugin implements Listener {
         // Note: For simplicity, we encode via ItemMeta persistent tags in namespaced key
         ItemMeta im = result.getItemMeta();
         if (im != null) {
-            im.getPersistentDataContainer().set(new NamespacedKey(this, "effect"), org.bukkit.persistence.PersistentDataType.STRING, potionName);
+            im.getPersistentDataContainer().set(new NamespacedKey(this, "effect"), PersistentDataType.STRING, potionName);
+            result.setItemMeta(im);
+        }
+        return result;
+    }
+
+    private ItemStack createInfusedFoodFromAbility(ItemStack baseFood, Ability ability) {
+        ItemStack result = new ItemStack(baseFood.getType(), 1);
+        ItemMeta meta = result.getItemMeta();
+        if (meta == null) return result;
+        String title = ability.getDisplayName() == null || ability.getDisplayName().isEmpty()
+            ? ("Infused " + toTitle(baseFood.getType().name()))
+            : ability.getDisplayName();
+        meta.setDisplayName(title);
+        List<String> lore = new ArrayList<>();
+        lore.addAll(ability.getLoreLines());
+        if (lore.isEmpty()) lore.add("Right-click or eat to gain effects");
+        meta.setLore(lore);
+        meta.addEnchant(Enchantment.LUCK, 1, true);
+        meta.setCustomModelData(90210);
+        result.setItemMeta(meta);
+        ItemMeta im = result.getItemMeta();
+        if (im != null) {
+            im.getPersistentDataContainer().set(this.keyAbilityId, PersistentDataType.STRING, ability.getId());
             result.setItemMeta(im);
         }
         return result;
@@ -209,15 +345,37 @@ public class FoodAbilitiesPlugin extends JavaPlugin implements Listener {
     private void applyEffects(Player player, ItemStack infusedFood) {
         ItemMeta meta = infusedFood.getItemMeta();
         if (meta == null) return;
-        String potionName = meta.getPersistentDataContainer().get(new NamespacedKey(this, "effect"), org.bukkit.persistence.PersistentDataType.STRING);
-        if (potionName == null) return;
+        String abilityId = meta.getPersistentDataContainer().get(this.keyAbilityId, PersistentDataType.STRING);
+        if (abilityId != null) {
+            Ability ability = abilityById.get(abilityId.toLowerCase(Locale.ROOT));
+            if (ability != null) {
+                for (PotionEffect effect : ability.getPotionEffects()) {
+                    player.addPotionEffect(effect);
+                }
+                return;
+            }
+        }
 
-        // Map potion types to effect sets and strengths (speed 10, fire resistance, etc.)
-        // Infinite effects approximated by very long duration and refresh on join.
+        String potionName = meta.getPersistentDataContainer().get(new NamespacedKey(this, "effect"), PersistentDataType.STRING);
+        if (potionName == null) return;
         List<PotionEffect> effects = mapPotionToEffects(potionName);
         for (PotionEffect effect : effects) {
             player.addPotionEffect(effect);
         }
+
+    }
+
+    @Override
+    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        if (!"foodabilities".equalsIgnoreCase(label)) return false;
+        if (args.length == 1 && args[0].equalsIgnoreCase("reload")) {
+            reloadPluginConfig();
+            registerDynamicRecipeInfo();
+            sender.sendMessage("FoodAbilities config reloaded.");
+            return true;
+        }
+        sender.sendMessage("Usage: /foodabilities reload");
+        return true;
     }
 
     private List<PotionEffect> mapPotionToEffects(String potionName) {
